@@ -76,32 +76,34 @@ export async function persistTurns(input: {
   }
 }
 
-export async function findRelatedTurns(chatId: string, currentTurnId: string, query: string) {
+export async function findRelatedTurns(chatId: string, currentTurnId: string, query: string, options: { semantic?: boolean } = {}) {
   const sql = getSql()
   if (!sql || !query.trim()) return []
 
   let semantic: Array<Record<string, unknown>> = []
-  try {
-    const { embedding } = await embed({
-      model: gateway.embeddingModel('openai/text-embedding-3-small'),
-      value: query.slice(0, 8000),
-    })
-    const vector = vectorLiteral(embedding)
-    semantic = await sql`
-      SELECT message.client_id, message.role, message.content, message.chat_id, thread.title
-      FROM chat_messages AS message
-      JOIN chat_threads AS thread ON thread.id = message.chat_id
-      WHERE message.chat_id = ${chatId}
-        AND message.client_id <> ${currentTurnId}
-        AND message.embedding IS NOT NULL
-      ORDER BY message.embedding <=> ${vector}::vector
-      LIMIT 10
-    `
-  } catch {
-    console.error('Semantic chat search is unavailable; using full-text search.')
+  if (options.semantic !== false) {
+    try {
+      const { embedding } = await embed({
+        model: gateway.embeddingModel('openai/text-embedding-3-small'),
+        value: query.slice(0, 8000),
+      })
+      const vector = vectorLiteral(embedding)
+      semantic = await sql`
+        SELECT message.client_id, message.role, message.content, message.chat_id, thread.title, message.created_at
+        FROM chat_messages AS message
+        JOIN chat_threads AS thread ON thread.id = message.chat_id
+        WHERE message.chat_id = ${chatId}
+          AND message.client_id <> ${currentTurnId}
+          AND message.embedding IS NOT NULL
+        ORDER BY message.embedding <=> ${vector}::vector
+        LIMIT 10
+      `
+    } catch {
+      console.error('Semantic chat search is unavailable; using full-text search.')
+    }
   }
   const lexical = await sql`
-      SELECT message.client_id, message.role, message.content, message.chat_id, thread.title
+      SELECT message.client_id, message.role, message.content, message.chat_id, thread.title, message.created_at
       FROM chat_messages AS message
       JOIN chat_threads AS thread ON thread.id = message.chat_id
       WHERE message.chat_id = ${chatId}
@@ -111,7 +113,7 @@ export async function findRelatedTurns(chatId: string, currentTurnId: string, qu
       LIMIT 10
     `
 
-  const ranked = new Map<string, { role: string; content: string; chatId: string; title: string; score: number }>()
+  const ranked = new Map<string, { role: string; content: string; chatId: string; title: string; createdAt: string; score: number }>()
   for (const [results, weight] of [[semantic, 1], [lexical, 1]] as const) {
     results.forEach((row, index) => {
       const id = `${row.chat_id}:${row.client_id}`
@@ -121,6 +123,7 @@ export async function findRelatedTurns(chatId: string, currentTurnId: string, qu
         content: row.content as string,
         chatId: row.chat_id as string,
         title: row.title as string,
+        createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
         score: (previous?.score ?? 0) + weight / (60 + index + 1),
       })
     })

@@ -1,14 +1,16 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Archive, AudioLines, Check, ChevronDown, Circle, Menu, MessageSquare, Mic, Moon, MoreHorizontal, Plus, Search, Shield, Sparkles, Sun, UserRound, Wrench, X } from 'lucide-react'
-import { useEveAgent } from 'eve/react'
+import { openai } from '@ai-sdk/openai'
+import { experimental_useRealtime } from '@ai-sdk/react'
 import { loadChatSnapshot, saveChatSnapshot, type StoredLogEntry } from '@/lib/chat-store'
 
 type LogEntry = StoredLogEntry
-type SpeechResult = { 0: { transcript: string }; isFinal: boolean }
-type SpeechRecognizer = { continuous: boolean; interimResults: boolean; lang: string; onresult: ((event: { results: ArrayLike<SpeechResult>; resultIndex?: number }) => void) | null; onerror: (() => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }
-type CaseItem = { id: string; title: string; location: string; status: 'LIVE' | 'STANDBY' | 'CLOSED'; time: string; unread?: boolean }
+type CaseItem = { id: string; title: string; location: string; status: 'LIVE' | 'STANDBY' | 'CLOSED'; time: string; unread?: boolean; address?: string; callTime?: string; callType?: string }
+
+const liveVoiceModel = openai.experimental_realtime('gpt-live-1')
+const liveGatewayUrl = 'wss://ai-gateway.vercel.sh/v1/live/sessions'
 
 const initialCases: CaseItem[] = [
   { id: 'CP-1048', title: 'North Harbor incident', location: 'North Harbor', status: 'LIVE', time: 'now', unread: true },
@@ -33,60 +35,123 @@ export default function Page() {
   const [logs, setLogs] = useState<Record<string, LogEntry[]>>({ 'CP-1048': firstLog })
   const [agentOn, setAgentOn] = useState(false)
   const [mobileRail, setMobileRail] = useState(false)
-  const [recording, setRecording] = useState(false)
   const [search, setSearch] = useState('')
   const [storageReady, setStorageReady] = useState(false)
   const [storageError, setStorageError] = useState(false)
   const [databaseStatus, setDatabaseStatus] = useState<'checking' | 'local' | 'connected' | 'error'>('checking')
+  const [liveToken, setLiveToken] = useState('')
+  const [liveInstructions, setLiveInstructions] = useState('')
+  const [pendingLiveStream, setPendingLiveStream] = useState<MediaStream | null>(null)
+  const [liveContextUpdate, setLiveContextUpdate] = useState<{ content: string; channel: 'thinking' | 'commentary' } | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const recordingChatId = useRef('')
-  const speechRef = useRef<SpeechRecognizer | null>(null)
-  const lastFinalResultRef = useRef(0)
-  const turnQueueRef = useRef<Promise<void>>(Promise.resolve())
-  const sessionActiveRef = useRef(false)
-  const assistantSpeakingRef = useRef(false)
-  const pendingAssistantRef = useRef<{ chatId: string; id: number; transcript: string } | null>(null)
+  const transcriptEntriesRef = useRef(new Map<string, string>())
+  const activeOfficerTranscriptRef = useRef({ startMs: -1, text: '' })
+  const lastMemoryQueryRef = useRef('')
+  const memorySearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0]
   const currentLogs = logs[selectedId] ?? []
-  const scoutAgent = useEveAgent({
-    onEvent(event) {
-      if (event.type !== 'message.appended') return
-      const pending = pendingAssistantRef.current
-      if (!pending) return
-      pending.transcript += event.data.messageDelta
-      const transcript = pending.transcript
-      setLogs((all) => ({ ...all, [pending.chatId]: (all[pending.chatId] ?? []).map((entry) => entry.id === pending.id ? { ...entry, transcript, duration: 'live' } : entry) }))
+  const realtimeConfig = useMemo(() => ({
+    instructions: liveInstructions || 'You are Scout, the concise OnScene field assistant. Listen to the officer and follow your system instructions.',
+    providerOptions: { openai: { store: false, delegation: { type: 'client' as const } } },
+  }), [liveInstructions])
+  const liveVoice = experimental_useRealtime({
+    model: liveVoiceModel,
+    api: {
+      websocket: liveGatewayUrl,
+      protocols: liveToken ? ['ai-gateway-realtime.v1', `ai-gateway-auth.${liveToken}`] : [],
     },
-    onFinish(snapshot) {
-      const pending = pendingAssistantRef.current
-      if (!pending) return
-      const assistantMessage = [...snapshot.data.messages].reverse().find((message) => message.role === 'assistant')
-      const transcript = assistantMessage?.parts.filter((part) => part.type === 'text').map((part) => part.text).join(' ').trim() || pending.transcript
-      setLogs((all) => ({ ...all, [pending.chatId]: (all[pending.chatId] ?? []).map((entry) => entry.id === pending.id ? { ...entry, transcript, duration: 'done' } : entry) }))
-      pendingAssistantRef.current = null
-      if (transcript && typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel()
-        assistantSpeakingRef.current = true
-        speechRef.current?.stop()
-        const spokenReply = new SpeechSynthesisUtterance(transcript)
-        const resumeRecognition = () => {
-          assistantSpeakingRef.current = false
-          if (sessionActiveRef.current && speechRef.current) {
-            try { speechRef.current.start() } catch { /* Recognition restarts from its onend callback if needed. */ }
-          }
+    sessionConfig: realtimeConfig,
+    sampleRate: 24000,
+    maxPlaybackBufferSeconds: 2,
+    onEvent(event) {
+      const chatId = recordingChatId.current
+      if (event.type === 'session-started') {
+        setLiveContextUpdate({ content: 'Start the conversation now by asking the officer what they are seeing. Do not list records.', channel: 'commentary' })
+        return
+      }
+      if (event.type === 'session-usage') {
+        const seconds = Math.floor(event.usage.seconds)
+        setLiveUsage(`${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`)
+        return
+      }
+      if (event.type !== 'transcript-fragment' || !chatId) return
+
+      const speaker = event.speaker === 'user' ? 'officer' : 'assistant'
+      const segmentId = `${chatId}:live:${speaker}:${event.startMs}`
+      const transcript = `${transcriptEntriesRef.current.get(segmentId) ?? ''}${event.delta}`
+      transcriptEntriesRef.current.set(segmentId, transcript)
+      setLogs((all) => {
+        const rows = all[chatId] ?? []
+        const existing = rows.findIndex((entry) => entry.memoryId === segmentId)
+        const next: LogEntry = {
+          id: existing >= 0 ? rows[existing].id : Date.now() + Math.random(),
+          memoryId: segmentId,
+          kind: speaker,
+          time: 'now',
+          transcript,
+          duration: 'live',
         }
-        spokenReply.onend = resumeRecognition
-        spokenReply.onerror = resumeRecognition
-        window.speechSynthesis.speak(spokenReply)
+        return { ...all, [chatId]: existing >= 0 ? rows.map((entry, index) => index === existing ? next : entry) : [...rows, next] }
+      })
+
+      if (event.speaker === 'user') {
+        const active = activeOfficerTranscriptRef.current
+        activeOfficerTranscriptRef.current = event.startMs === active.startMs
+          ? { startMs: active.startMs, text: `${active.text}${event.delta}` }
+          : { startMs: event.startMs, text: event.delta }
+        if (memorySearchTimerRef.current) clearTimeout(memorySearchTimerRef.current)
+        const query = activeOfficerTranscriptRef.current.text.trim().slice(-900)
+        if (query.length >= 8) {
+          memorySearchTimerRef.current = setTimeout(() => { void searchLiveMemory(chatId, query) }, 900)
+        }
       }
     },
     onError(error) {
-      const pending = pendingAssistantRef.current
-      if (!pending) return
-      setLogs((all) => ({ ...all, [pending.chatId]: (all[pending.chatId] ?? []).map((entry) => entry.id === pending.id ? { ...entry, transcript: error.message || 'Scout could not respond.', duration: 'error' } : entry) }))
-      pendingAssistantRef.current = null
+      const chatId = recordingChatId.current
+      setAgentOn(false)
+      if (!chatId) return
+      setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'GPT-Live connection interrupted', detail: error.message }] }))
     },
   })
+  const [liveUsage, setLiveUsage] = useState('0:00')
+
+  useEffect(() => {
+    if (!liveContextUpdate || liveVoice.status !== 'connected') return
+    const contextUpdate = liveContextUpdate
+    setLiveContextUpdate(null)
+    void liveVoice.sendEvent({
+      type: 'context-append',
+      delegationId: null,
+      content: contextUpdate.content,
+      providerOptions: { openai: { channel: contextUpdate.channel } },
+    }).catch((error) => {
+      console.error('Could not update GPT-Live context:', error instanceof Error ? error.message : 'unknown error')
+    })
+  }, [liveContextUpdate, liveVoice.status, liveVoice.sendEvent])
+
+  useEffect(() => {
+    if (!liveToken || !pendingLiveStream || !liveInstructions) return
+    let active = true
+    void liveVoice.connect({ stream: pendingLiveStream }).then(() => {
+      if (active) {
+        setAgentOn(true)
+        setPendingLiveStream(null)
+      }
+    }).catch((error) => {
+      if (active) {
+        setAgentOn(false)
+        setLogs((all) => ({ ...all, [recordingChatId.current]: [...(all[recordingChatId.current] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Could not start GPT-Live', detail: error instanceof Error ? error.message : 'Check the live assistant connection.' }] }))
+      }
+    })
+    return () => { active = false }
+  }, [liveToken, liveInstructions, pendingLiveStream, liveVoice.connect])
+
+  useEffect(() => () => {
+    if (memorySearchTimerRef.current) clearTimeout(memorySearchTimerRef.current)
+    liveVoice.disconnect()
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+  }, [liveVoice.disconnect])
 
   useEffect(() => {
     const savedTheme = window.localStorage.getItem('on-scene-theme')
@@ -148,126 +213,112 @@ export default function Page() {
     return () => window.clearTimeout(timeout)
   }, [cases, logs, storageReady])
 
+  async function searchLiveMemory(chatId: string, query: string) {
+    if (!query || query === lastMemoryQueryRef.current) return
+    lastMemoryQueryRef.current = query
+    try {
+      const response = await fetch('/api/live/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ caseId: chatId, query }),
+      })
+      const result = await response.json() as {
+        system?: string
+        checkedAt?: string
+        results?: Array<{ role: string; content: string; record: { title: string; chatId: string; savedAt: string } }>
+        error?: string
+      }
+      if (!response.ok) throw new Error(result.error || 'Neon case memory search failed.')
+      const records = result.results ?? []
+      const detail = records.length
+        ? records.map((record) => `${record.record.title} (${record.record.chatId}), saved ${new Date(record.record.savedAt).toLocaleString()}: ${record.content}`).join('\n')
+        : `No matching prior case-chat messages. Checked ${result.checkedAt ? new Date(result.checkedAt).toLocaleString() : 'just now'}.`
+      setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: Date.now() + Math.random(), kind: 'tool', time: 'now', text: `Searched ${result.system ?? 'Neon case chat memory'}`, detail: records.length ? `${records.length} saved chat message(s) returned.` : 'No matching prior messages.' }] }))
+      setLiveContextUpdate({
+        channel: 'thinking',
+        content: `Connected system result: ${result.system ?? 'Neon case chat memory'}. Checked ${result.checkedAt ? new Date(result.checkedAt).toISOString() : 'just now'}. This is only saved chat history for the selected case, not a live incident or neighborhood records feed. ${records.length ? `Records returned: ${detail}` : 'No matching prior chat messages were returned.'}`,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Neon case memory is unavailable.'
+      setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: Date.now() + Math.random(), kind: 'tool', time: 'now', text: 'Neon case chat memory unavailable', detail: message }] }))
+      setLiveContextUpdate({ channel: 'thinking', content: `Neon case chat memory could not be searched. Do not claim that a neighborhood records or incident feed was checked.` })
+    }
+  }
+
   function selectCase(item: CaseItem) {
-    if (scoutAgent.status === 'streaming' || scoutAgent.status === 'submitted') void scoutAgent.cancel().catch(() => {})
-    scoutAgent.reset()
-    speechRef.current?.stop()
+    liveVoice.disconnect()
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
-    sessionActiveRef.current = false
-    assistantSpeakingRef.current = false
-    window.speechSynthesis?.cancel()
+    recordingChatId.current = ''
+    setLiveToken('')
+    setLiveInstructions('')
+    setPendingLiveStream(null)
     setSelectedId(item.id)
     setMobileRail(false)
     setAgentOn(false)
-    setRecording(false)
+    setLiveUsage('0:00')
   }
 
   function newChat() {
-    if (scoutAgent.status === 'streaming' || scoutAgent.status === 'submitted') void scoutAgent.cancel().catch(() => {})
-    scoutAgent.reset()
-    sessionActiveRef.current = false
-    speechRef.current?.stop()
-    speechRef.current = null
+    liveVoice.disconnect()
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
-    window.speechSynthesis?.cancel()
+    recordingChatId.current = ''
+    setLiveToken('')
+    setLiveInstructions('')
+    setPendingLiveStream(null)
     const id = `CP-${String(1100 + cases.length)}`
     const fresh = { id, title: 'New scene chat', location: 'Unassigned', status: 'STANDBY' as const, time: 'now' }
     setCases((all) => [fresh, ...all])
     setLogs((all) => ({ ...all, [id]: [{ id: Date.now(), kind: 'system', time: 'now', text: 'New voice chat created', detail: 'Voice turns and case activity will stay together here.' }] }))
     setSelectedId(id)
     setAgentOn(false)
-    setRecording(false)
+    setLiveUsage('0:00')
     setMobileRail(false)
   }
 
   async function startAgent() {
+    let stream: MediaStream | null = null
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } })
       streamRef.current = stream
       recordingChatId.current = selectedId
-      lastFinalResultRef.current = 0
-      const speechWindow = window as Window & { SpeechRecognition?: new () => SpeechRecognizer; webkitSpeechRecognition?: new () => SpeechRecognizer }
-      const SpeechRecognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition
-      if (!SpeechRecognition) {
-        stream.getTracks().forEach((track) => track.stop())
-        streamRef.current = null
-        setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live transcription unavailable', detail: 'Use a browser that supports speech recognition to talk with Scout.' }] }))
-        return
-      }
-      const speech = new SpeechRecognition()
-      speech.continuous = true
-      speech.interimResults = true
-      speech.lang = 'en-US'
-      speech.onresult = (event) => {
-        const results = Array.from(event.results)
-        const startIndex = Math.max(event.resultIndex ?? 0, lastFinalResultRef.current)
-        const finalized: string[] = []
-        for (let index = startIndex; index < results.length; index += 1) {
-          if (results[index].isFinal) {
-            const phrase = results[index][0]?.transcript?.trim()
-            if (phrase) finalized.push(phrase)
-            lastFinalResultRef.current = index + 1
-          }
-        }
-        if (finalized.length) {
-          const transcript = finalized.join(' ')
-          turnQueueRef.current = turnQueueRef.current.then(() => sendOfficerTurn(transcript))
-        }
-      }
-      speech.onerror = () => {
-        setLogs((all) => ({ ...all, [recordingChatId.current]: [...(all[recordingChatId.current] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Speech recognition interrupted', detail: 'Check microphone access and restart the live assistant.' }] }))
-      }
-      speech.onend = () => {
-        if (sessionActiveRef.current && !assistantSpeakingRef.current) {
-          try { speech.start() } catch { /* The browser may still be closing the recognition session. */ }
-        }
-      }
-      speechRef.current = speech
-      speech.start()
-      sessionActiveRef.current = true
-      setAgentOn(true)
-      setRecording(true)
-      setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live assistant started', detail: 'Microphone active · case context loaded' }] }))
-    } catch {
-      sessionActiveRef.current = false
-      streamRef.current?.getTracks().forEach((track) => track.stop())
-      streamRef.current = null
-      setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Microphone unavailable', detail: 'Allow microphone access to start the live voice session.' }] }))
-    }
-  }
-
-  async function sendOfficerTurn(transcript: string) {
-    const chatId = recordingChatId.current
-    const caseItem = cases.find((item) => item.id === chatId)
-    const assistantId = Date.now() + Math.random()
-    pendingAssistantRef.current = { chatId, id: assistantId, transcript: '' }
-    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId - 0.25, memoryId: crypto.randomUUID(), kind: 'officer', time: 'now', transcript, duration: 'done' }] }))
-    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId, memoryId: `${assistantId}:assistant`, kind: 'assistant', time: 'now', transcript: '', duration: '…' }] }))
-
-    try {
-      await scoutAgent.send(transcript, {
-        clientContext: { caseId: chatId, caseTitle: caseItem?.title ?? 'Unknown case', location: caseItem?.location ?? 'Unknown' },
+      const response = await fetch('/api/live/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callSlip: selected }),
       })
+      const setup = await response.json() as { token?: string; expiresAt?: number; instructions?: string; error?: string }
+      if (!response.ok || !setup.token || !setup.instructions) throw new Error(setup.error || 'GPT-Live could not be started.')
+      if (setup.expiresAt && Date.now() >= setup.expiresAt * 1000) throw new Error('The live-session token expired. Try again.')
+      transcriptEntriesRef.current.clear()
+      activeOfficerTranscriptRef.current = { startMs: -1, text: '' }
+      lastMemoryQueryRef.current = ''
+      setLiveUsage('0:00')
+      setLiveInstructions(setup.instructions)
+      setLiveToken(setup.token)
+      setPendingLiveStream(stream)
+      setAgentOn(true)
+      setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'GPT-Live assistant starting', detail: 'Full-duplex audio · AI Gateway connected' }] }))
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Scout could not respond. Check the Scout connection.'
-      setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId || entry.id === assistantId - 0.25 ? { ...entry, duration: 'error', ...(entry.id === assistantId ? { transcript: message } : {}) } : entry) }))
-      pendingAssistantRef.current = null
+      setAgentOn(false)
+      stream?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+      recordingChatId.current = ''
+      const message = error instanceof Error ? error.message : 'Allow microphone access and check the AI Gateway connection.'
+      setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live assistant unavailable', detail: message }] }))
     }
   }
 
-  function endAgent() {
-    if (scoutAgent.status === 'streaming' || scoutAgent.status === 'submitted') void scoutAgent.cancel().catch(() => {})
-    sessionActiveRef.current = false
-    assistantSpeakingRef.current = false
-    speechRef.current?.stop()
-    speechRef.current = null
+  async function endAgent() {
+    await liveVoice.close().catch(() => liveVoice.disconnect())
     setAgentOn(false)
-    setRecording(false)
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
-    window.speechSynthesis?.cancel()
+    recordingChatId.current = ''
+    setLiveToken('')
+    setLiveInstructions('')
+    setPendingLiveStream(null)
     setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live assistant ended', detail: 'Activity saved to this chat.' }] }))
   }
 
@@ -302,13 +353,13 @@ export default function Page() {
               <div className="mb-8 flex items-center gap-3"><div className="h-px flex-1 bg-[var(--scene-border-soft)]" /><span className="text-[9px] font-medium uppercase tracking-[0.13em] text-[var(--scene-muted)]">Today · 10:41 AM</span><div className="h-px flex-1 bg-[var(--scene-border-soft)]" /></div>
               <div className="space-y-6">{currentLogs.map((entry) => <LogRow key={entry.id} entry={entry} />)}</div>
               {currentLogs.length === 0 && <div className="rounded-xl border border-dashed border-[var(--scene-border)] p-8 text-center"><MessageSquare className="mx-auto mb-3 text-[var(--scene-muted)]" size={19} /><p className="text-[13px] font-medium">Start a voice chat</p><p className="mt-1 text-[11px] text-[var(--scene-muted)]">Voice turns and case activity will stay together here.</p></div>}
-              {recording && <div className="mt-6 flex items-center gap-2 pl-10 text-[10px] text-[#58735e]"><span className="size-1.5 animate-pulse rounded-full bg-[#6e9877]" /> Listening to your voice</div>}
+              {liveVoice.isCapturing && <div className="mt-6 flex items-center gap-2 pl-10 text-[10px] text-[#58735e]"><span className="size-1.5 animate-pulse rounded-full bg-[#6e9877]" /> Listening live · {liveUsage}</div>}
             </div>
           </div>
 
           <div className="shrink-0 border-t border-[var(--scene-border)] bg-[var(--scene-panel)] px-4 pb-[max(16px,env(safe-area-inset-bottom))] pt-4 sm:px-8 md:px-12 lg:px-16">
             <div className="mx-auto flex max-w-[760px] flex-col items-center">
-              {agentOn ? <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><span className="size-1.5 animate-pulse rounded-full bg-[#6e9877]" /> Listening live</div><div className="mb-3 flex h-12 items-center gap-1" aria-label="Live microphone activity">{[10, 19, 13, 28, 17, 36, 20, 13, 25, 15, 32, 18, 11, 27, 16, 34, 19, 12, 24, 15].map((height, index) => <span key={index} className="w-1 animate-pulse rounded-full bg-[#829783]" style={{ height, animationDelay: `${index * 45}ms` }} />)}</div><button onClick={endAgent} className="rounded-lg border border-[var(--scene-border)] bg-[var(--scene-card)] px-4 py-2 text-[10px] font-medium text-[var(--scene-text)] hover:bg-[var(--scene-hover)]">End live assistant</button></> : <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><Mic size={13} /> Voice assistant is off</div><button onClick={startAgent} className="flex items-center justify-center gap-2 rounded-lg bg-[#31533d] px-5 py-3 text-[11px] font-medium text-white shadow-sm transition hover:bg-[#274833]"><Sparkles size={14} /> Start live assistant</button><p className="mt-2.5 flex items-center gap-1.5 text-[9px] text-[var(--scene-muted)]"><Check size={11} /> Voice and activity logs stay in this chat</p></>}
+              {agentOn ? <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><span className="size-1.5 animate-pulse rounded-full bg-[#6e9877]" /> {liveVoice.status === 'connected' ? `GPT-Live · ${liveUsage}` : 'Connecting to GPT-Live'}</div><div className="mb-3 flex h-12 items-center gap-1" aria-label="Live microphone activity">{[10, 19, 13, 28, 17, 36, 20, 13, 25, 15, 32, 18, 11, 27, 16, 34, 19, 12, 24, 15].map((height, index) => <span key={index} className="w-1 animate-pulse rounded-full bg-[#829783]" style={{ height, animationDelay: `${index * 45}ms` }} />)}</div><button onClick={endAgent} className="rounded-lg border border-[var(--scene-border)] bg-[var(--scene-card)] px-4 py-2 text-[10px] font-medium text-[var(--scene-text)] hover:bg-[var(--scene-hover)]">End live assistant</button></> : <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><Mic size={13} /> Voice assistant is off</div><button onClick={startAgent} className="flex items-center justify-center gap-2 rounded-lg bg-[#31533d] px-5 py-3 text-[11px] font-medium text-white shadow-sm transition hover:bg-[#274833]"><Sparkles size={14} /> Start live assistant</button><p className="mt-2.5 flex items-center gap-1.5 text-[9px] text-[var(--scene-muted)]"><Check size={11} /> Voice and activity logs stay in this chat</p></>}
             </div>
           </div>
         </div>
