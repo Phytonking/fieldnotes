@@ -1,11 +1,12 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Archive, AudioLines, Check, ChevronDown, Circle, Menu, MessageSquare, Mic, MoreHorizontal, Plus, Search, Shield, Sparkles, UserRound, Wrench, X } from 'lucide-react'
+import { loadChatSnapshot, saveChatSnapshot, type StoredLogEntry } from '@/lib/chat-store'
 
-type LogEntry = { id: number; kind: 'officer' | 'assistant' | 'tool' | 'system'; time: string; text?: string; transcript?: string; detail?: string; duration?: string; audioUrl?: string }
-type SpeechResult = { 0: { transcript: string } }
-type SpeechRecognizer = { continuous: boolean; interimResults: boolean; lang: string; onresult: ((event: { results: ArrayLike<SpeechResult> }) => void) | null; start: () => void; stop: () => void }
+type LogEntry = StoredLogEntry
+type SpeechResult = { 0: { transcript: string }; isFinal: boolean }
+type SpeechRecognizer = { continuous: boolean; interimResults: boolean; lang: string; onresult: ((event: { results: ArrayLike<SpeechResult>; resultIndex?: number }) => void) | null; onerror: (() => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }
 type CaseItem = { id: string; title: string; location: string; status: 'LIVE' | 'STANDBY' | 'CLOSED'; time: string; unread?: boolean }
 
 const initialCases: CaseItem[] = [
@@ -32,18 +33,53 @@ export default function Page() {
   const [mobileRail, setMobileRail] = useState(false)
   const [recording, setRecording] = useState(false)
   const [search, setSearch] = useState('')
-  const recorderRef = useRef<MediaRecorder | null>(null)
+  const [storageReady, setStorageReady] = useState(false)
+  const [storageError, setStorageError] = useState(false)
   const streamRef = useRef<MediaStream | null>(null)
-  const recordingStartedAt = useRef(0)
   const recordingChatId = useRef('')
-  const transcriptRef = useRef('')
   const speechRef = useRef<SpeechRecognizer | null>(null)
+  const lastFinalResultRef = useRef(0)
+  const conversationRef = useRef<Record<string, Array<{ role: 'user' | 'assistant'; content: string }>>>({})
+  const turnQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const sessionActiveRef = useRef(false)
+  const assistantSpeakingRef = useRef(false)
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0]
   const currentLogs = logs[selectedId] ?? []
 
+  useEffect(() => {
+    let active = true
+    loadChatSnapshot().then((snapshot) => {
+      if (!active) return
+      if (snapshot) {
+        setCases(snapshot.cases)
+        setLogs(Object.fromEntries(Object.entries(snapshot.logs).map(([caseId, entries]) => [
+          caseId,
+          entries.map((entry) => ({ ...entry, audioUrl: entry.audioBlob ? URL.createObjectURL(entry.audioBlob) : undefined })),
+        ])))
+        if (snapshot.selectedId && snapshot.cases.some((item) => item.id === snapshot.selectedId)) setSelectedId(snapshot.selectedId)
+        else if (snapshot.cases.length) setSelectedId(snapshot.cases[0].id)
+      }
+      setStorageReady(true)
+    }).catch(() => {
+      if (!active) return
+      setStorageError(true)
+      setStorageReady(true)
+    })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (!storageReady) return
+    saveChatSnapshot({ cases, logs, selectedId }).then(() => setStorageError(false)).catch(() => setStorageError(true))
+  }, [cases, logs, selectedId, storageReady])
+
   function selectCase(item: CaseItem) {
     speechRef.current?.stop()
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    sessionActiveRef.current = false
+    assistantSpeakingRef.current = false
+    window.speechSynthesis?.cancel()
     setSelectedId(item.id)
     setMobileRail(false)
     setAgentOn(false)
@@ -51,6 +87,12 @@ export default function Page() {
   }
 
   function newChat() {
+    sessionActiveRef.current = false
+    speechRef.current?.stop()
+    speechRef.current = null
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    window.speechSynthesis?.cancel()
     const id = `CP-${String(1100 + cases.length)}`
     const fresh = { id, title: 'New field note', location: 'Unassigned', status: 'STANDBY' as const, time: 'now' }
     setCases((all) => [fresh, ...all])
@@ -64,50 +106,126 @@ export default function Page() {
   async function startAgent() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const recorder = new MediaRecorder(stream)
-      const chunks: BlobPart[] = []
       streamRef.current = stream
-      recorderRef.current = recorder
       recordingChatId.current = selectedId
-      recordingStartedAt.current = Date.now()
-      transcriptRef.current = ''
+      lastFinalResultRef.current = 0
+      conversationRef.current[selectedId] = currentLogs
+        .filter((entry) => (entry.kind === 'officer' || entry.kind === 'assistant') && entry.transcript)
+        .map((entry) => ({ role: entry.kind === 'officer' ? 'user' as const : 'assistant' as const, content: entry.transcript! }))
       const speechWindow = window as Window & { SpeechRecognition?: new () => SpeechRecognizer; webkitSpeechRecognition?: new () => SpeechRecognizer }
       const SpeechRecognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition
-      if (SpeechRecognition) {
-        const speech = new SpeechRecognition()
-        speech.continuous = true
-        speech.interimResults = true
-        speech.lang = 'en-US'
-        speech.onresult = (event) => { transcriptRef.current = Array.from(event.results).map((result) => result[0]?.transcript ?? '').join(' ').trim() }
-        speechRef.current = speech
-        speech.start()
-      }
-      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data) }
-      recorder.onstop = () => {
-        speechRef.current?.stop()
-        speechRef.current = null
-        const audioUrl = URL.createObjectURL(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }))
-        const seconds = Math.max(1, Math.round((Date.now() - recordingStartedAt.current) / 1000))
-        const duration = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
-        setLogs((all) => ({ ...all, [recordingChatId.current]: [...(all[recordingChatId.current] ?? []), { id: Date.now(), kind: 'officer', time: 'now', duration, audioUrl, transcript: transcriptRef.current }] }))
+      if (!SpeechRecognition) {
         stream.getTracks().forEach((track) => track.stop())
         streamRef.current = null
-        recorderRef.current = null
+        setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live transcription unavailable', detail: 'Use a browser that supports speech recognition to talk with Eve.' }] }))
+        return
       }
-      recorder.start()
+      const speech = new SpeechRecognition()
+      speech.continuous = true
+      speech.interimResults = true
+      speech.lang = 'en-US'
+      speech.onresult = (event) => {
+        const results = Array.from(event.results)
+        const startIndex = Math.max(event.resultIndex ?? 0, lastFinalResultRef.current)
+        const finalized: string[] = []
+        for (let index = startIndex; index < results.length; index += 1) {
+          if (results[index].isFinal) {
+            const phrase = results[index][0]?.transcript?.trim()
+            if (phrase) finalized.push(phrase)
+            lastFinalResultRef.current = index + 1
+          }
+        }
+        if (finalized.length) {
+          const transcript = finalized.join(' ')
+          turnQueueRef.current = turnQueueRef.current.then(() => sendOfficerTurn(transcript))
+        }
+      }
+      speech.onerror = () => {
+        setLogs((all) => ({ ...all, [recordingChatId.current]: [...(all[recordingChatId.current] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Speech recognition interrupted', detail: 'Check microphone access and restart the live assistant.' }] }))
+      }
+      speech.onend = () => {
+        if (sessionActiveRef.current && !assistantSpeakingRef.current) {
+          try { speech.start() } catch { /* The browser may still be closing the recognition session. */ }
+        }
+      }
+      speechRef.current = speech
+      speech.start()
+      sessionActiveRef.current = true
       setAgentOn(true)
       setRecording(true)
       setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live assistant started', detail: 'Microphone active · case context loaded' }] }))
     } catch {
+      sessionActiveRef.current = false
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
       setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Microphone unavailable', detail: 'Allow microphone access to start the live voice session.' }] }))
     }
   }
 
+  async function sendOfficerTurn(transcript: string) {
+    const chatId = recordingChatId.current
+    const officerTurn = { role: 'user' as const, content: transcript }
+    const history = conversationRef.current[chatId] ?? []
+    conversationRef.current[chatId] = [...history, officerTurn]
+    const assistantId = Date.now() + Math.random()
+    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId - 0.25, kind: 'officer', time: 'now', transcript, duration: 'live' }] }))
+    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId, kind: 'assistant', time: 'now', transcript: '', duration: '…' }] }))
+
+    try {
+      const caseItem = cases.find((item) => item.id === chatId)
+      const response = await fetch('/api/assistant', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ caseId: chatId, caseTitle: caseItem?.title, location: caseItem?.location, messages: conversationRef.current[chatId] }),
+      })
+      if (!response.ok || !response.body) {
+        const error = await response.json().catch(() => ({})) as { error?: string }
+        throw new Error(error.error || 'Eve could not respond. Check the AI Gateway connection.')
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let answer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        answer += decoder.decode(value, { stream: true })
+        const streamedAnswer = answer
+        setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId ? { ...entry, transcript: streamedAnswer, duration: 'live' } : entry) }))
+      }
+      answer += decoder.decode()
+      conversationRef.current[chatId] = [...(conversationRef.current[chatId] ?? []), { role: 'assistant', content: answer }]
+      setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId ? { ...entry, transcript: answer, duration: 'live' } : entry) }))
+      if (answer && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel()
+        assistantSpeakingRef.current = true
+        speechRef.current?.stop()
+        const spokenReply = new SpeechSynthesisUtterance(answer)
+        const resumeRecognition = () => {
+          assistantSpeakingRef.current = false
+          if (sessionActiveRef.current && speechRef.current) {
+            try { speechRef.current.start() } catch { /* Recognition restarts from its onend callback if needed. */ }
+          }
+        }
+        spokenReply.onend = resumeRecognition
+        spokenReply.onerror = resumeRecognition
+        window.speechSynthesis.speak(spokenReply)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Eve could not respond. Check the AI Gateway connection.'
+      setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId ? { ...entry, transcript: message, duration: 'error' } : entry) }))
+    }
+  }
+
   function endAgent() {
+    sessionActiveRef.current = false
+    assistantSpeakingRef.current = false
     speechRef.current?.stop()
+    speechRef.current = null
     setAgentOn(false)
     setRecording(false)
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    window.speechSynthesis?.cancel()
     setLogs((all) => ({ ...all, [selectedId]: [...(all[selectedId] ?? []), { id: Date.now(), kind: 'system', time: 'now', text: 'Live assistant ended', detail: 'Activity saved to this chat.' }] }))
   }
 
@@ -133,7 +251,7 @@ export default function Page() {
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-[68px] shrink-0 items-center justify-between border-b border-[#e9e9e5] bg-[#fbfbfa] px-4 sm:px-7">
           <div className="flex min-w-0 items-center gap-3"><button onClick={() => setMobileRail(true)} className="rounded-md p-1.5 text-[#777871] hover:bg-[#f0f0ed] md:hidden" aria-label="Open chats"><Menu size={17} /></button><div className="min-w-0"><div className="flex items-center gap-2"><h1 className="truncate text-[14px] font-semibold tracking-[-0.02em]">{selected.title}</h1><ChevronDown size={13} className="shrink-0 text-[#aaa9a2]" /></div><p className="mt-0.5 truncate text-[10px] text-[#999a93]">{selected.id} <span className="mx-1 text-[#d0d0ca]">·</span> {selected.location}</p></div></div>
-          <div className="flex items-center gap-2"><div className="hidden items-center gap-1.5 rounded-full border border-[#e8e9e4] bg-white px-2.5 py-1.5 text-[10px] text-[#81827b] sm:flex"><Circle size={7} className="fill-[#79a084] text-[#79a084]" /> Secure workspace</div><button className="rounded-md p-2 text-[#91928b] hover:bg-[#f0f0ed]" aria-label="More conversation options"><MoreHorizontal size={17} /></button></div>
+          <div className="flex items-center gap-2"><div title={storageError ? 'Local database is unavailable; changes may not persist.' : 'Chats are saved in this browser.'} className="hidden items-center gap-1.5 rounded-full border border-[#e8e9e4] bg-white px-2.5 py-1.5 text-[10px] text-[#81827b] sm:flex"><Circle size={7} className={storageError ? 'fill-[#bf6c55] text-[#bf6c55]' : 'fill-[#79a084] text-[#79a084]'} /> {storageError ? 'Storage unavailable' : 'Saved on this device'}</div><button className="rounded-md p-2 text-[#91928b] hover:bg-[#f0f0ed]" aria-label="More conversation options"><MoreHorizontal size={17} /></button></div>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col">
