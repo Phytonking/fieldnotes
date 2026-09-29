@@ -4,6 +4,46 @@
 
 @custom-variant dark (&:is(.dark *));
 
+.on-scene[data-theme='light'] {
+  color-scheme: light;
+  --scene-bg: #f7f7f5;
+  --scene-fg: #20211f;
+  --scene-panel: #fbfbfa;
+  --scene-card: #ffffff;
+  --scene-border: #e7e7e3;
+  --scene-border-soft: #ecece8;
+  --scene-hover: #f1f1ee;
+  --scene-active: #efefec;
+  --scene-soft: #efefeb;
+  --scene-bubble: #eeefeb;
+  --scene-green-soft: #e9efe9;
+  --scene-activity: #f2f3ef;
+  --scene-mark: #20211f;
+  --scene-text: #555650;
+  --scene-muted: #8f9089;
+  --scene-faint: #a5a69f;
+}
+
+.on-scene[data-theme='dark'] {
+  color-scheme: dark;
+  --scene-bg: #141613;
+  --scene-fg: #e7e9e2;
+  --scene-panel: #1a1c19;
+  --scene-card: #20221e;
+  --scene-border: #343730;
+  --scene-border-soft: #2b2e28;
+  --scene-hover: #282a25;
+  --scene-active: #2a2d27;
+  --scene-soft: #252722;
+  --scene-bubble: #2d302a;
+  --scene-green-soft: #28332a;
+  --scene-activity: #242721;
+  --scene-mark: #284c37;
+  --scene-text: #d1d4cb;
+  --scene-muted: #a3a79e;
+  --scene-faint: #83877e;
+}
+
 @theme inline {
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
