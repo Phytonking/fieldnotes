@@ -15,10 +15,6 @@ const callSlipSchema = z.object({
 })
 
 export async function POST(request: Request) {
-  if (process.env.NODE_ENV === 'production') {
-    return NextResponse.json({ error: 'Officer authentication is required before opening a live session.' }, { status: 401 })
-  }
-
   const apiKey = process.env.AI_GATEWAY_API_KEY
   if (!apiKey) return NextResponse.json({ error: 'AI Gateway is not configured.' }, { status: 503 })
 

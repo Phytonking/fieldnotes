@@ -30,6 +30,4 @@ The browser keeps a local IndexedDB copy so chats survive reloads. To enable a s
 
 When `DATABASE_URL` is set, completed chat turns are saved in `chat_threads` and `chat_messages`. Live lookups use Postgres full-text search within the selected case and include the saved timestamp. Eve's `search_case_memory` tool can also use semantic retrieval with `pgvector`; when Gateway embedding access is unavailable it falls back to full-text search. Search results are historical context, not verified facts. Without `DATABASE_URL`, the app continues using browser-only storage and Scout has no server-side chat memory.
 
-The workspace does not yet provide officer sign-in or case-assignment claims. For that reason, Neon sync and browser access to the Eve agent fail closed in production until authentication and case-level authorization are configured. Local development uses Eve's local development identity.
-
-Neon stores the chat history and optional vectors in one Postgres database. Keep the deployment private until real officer sign-in and case-level access controls are configured.
+This hackathon demo has no officer sign-in or case-assignment authorization. Its chat sync, live-token, and memory-search endpoints are open so the demo works without accounts; use demo data only. Neon stores chat history and optional vectors in one Postgres database.
