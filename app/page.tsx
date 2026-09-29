@@ -360,7 +360,13 @@ export default function Page() {
 
           <div className="shrink-0 border-t border-[var(--scene-border)] bg-[var(--scene-panel)] px-4 pb-[max(16px,env(safe-area-inset-bottom))] pt-4 sm:px-8 md:px-12 lg:px-16">
             <div className="mx-auto flex max-w-[760px] flex-col items-center">
-              <DemoToolSweep key={selected.id} caseId={selected.id} title={selected.title} location={selected.location} />
+              <DemoToolSweep
+                key={selected.id}
+                caseId={selected.id}
+                title={selected.title}
+                location={selected.location}
+                onToolEvent={(entry) => setLogs((all) => ({ ...all, [selected.id]: [...(all[selected.id] ?? []), entry] }))}
+              />
               {agentOn ? <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><span className="size-1.5 animate-pulse rounded-full bg-[#6e9877]" /> {liveVoice.status === 'connected' ? `GPT-Live · ${liveUsage}` : 'Connecting to GPT-Live'}</div><div className="mb-3 flex h-12 items-center gap-1" aria-label="Live microphone activity">{[10, 19, 13, 28, 17, 36, 20, 13, 25, 15, 32, 18, 11, 27, 16, 34, 19, 12, 24, 15].map((height, index) => <span key={index} className="w-1 animate-pulse rounded-full bg-[#829783]" style={{ height, animationDelay: `${index * 45}ms` }} />)}</div><button onClick={endAgent} className="rounded-lg border border-[var(--scene-border)] bg-[var(--scene-card)] px-4 py-2 text-[10px] font-medium text-[var(--scene-text)] hover:bg-[var(--scene-hover)]">End live assistant</button></> : <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><Mic size={13} /> Voice assistant is off</div><button onClick={startAgent} className="flex items-center justify-center gap-2 rounded-lg bg-[#31533d] px-5 py-3 text-[11px] font-medium text-white shadow-sm transition hover:bg-[#274833]"><Sparkles size={14} /> Start live assistant</button><p className="mt-2.5 flex items-center gap-1.5 text-[9px] text-[var(--scene-muted)]"><Check size={11} /> Voice and activity logs stay in this chat</p></>}
             </div>
           </div>
@@ -370,14 +376,41 @@ export default function Page() {
   )
 }
 
-function DemoToolSweep({ caseId, title, location }: Pick<CaseItem, 'title' | 'location'> & { caseId: string }) {
+function DemoToolSweep({ caseId, title, location, onToolEvent }: Pick<CaseItem, 'title' | 'location'> & { caseId: string; onToolEvent: (entry: LogEntry) => void }) {
   const eve = useEveAgent()
+  const loggedToolCallIds = useRef(new Set<string>())
   const busy = eve.status === 'submitted' || eve.status === 'streaming' || eve.status === 'resuming'
   const tools = eve.data.messages.flatMap((message) => message.parts.filter((part) => part.type === 'dynamic-tool'))
   const answer = [...eve.data.messages].reverse().find((message) => message.role === 'assistant')?.parts
     .filter((part) => part.type === 'text')
     .map((part) => part.text)
     .join('')
+
+  useEffect(() => {
+    for (const tool of tools) {
+      if (loggedToolCallIds.current.has(tool.toolCallId)) continue
+      if (tool.state === 'output-available') {
+        loggedToolCallIds.current.add(tool.toolCallId)
+        const output = tool.output as { system?: string; message?: string } | undefined
+        onToolEvent({
+          id: Date.now() + Math.random(),
+          kind: 'tool',
+          time: 'now',
+          text: `Checked ${output?.system ?? tool.toolName.replaceAll('_', ' ')}`,
+          detail: output?.message ?? 'Demonstration tool call returned.',
+        })
+      } else if (tool.state === 'output-error') {
+        loggedToolCallIds.current.add(tool.toolCallId)
+        onToolEvent({
+          id: Date.now() + Math.random(),
+          kind: 'tool',
+          time: 'now',
+          text: `${tool.toolName.replaceAll('_', ' ')} unavailable`,
+          detail: tool.errorText,
+        })
+      }
+    }
+  }, [tools, onToolEvent])
 
   async function runSweep() {
     await eve.send(`Run the demonstration evidence and camera tool sweep for case ${caseId}. Call track_evidence, search_body_camera_footage, and search_flock_camera_footage before responding. Give a short spoken-ready summary, identify every system as demonstration data, and do not infer identities or facts beyond the returned records.`, {
