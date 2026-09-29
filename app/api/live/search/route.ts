@@ -10,10 +10,6 @@ const searchSchema = z.object({
 })
 
 export async function POST(request: Request) {
-  if (process.env.NODE_ENV === 'production') {
-    return NextResponse.json({ error: 'Officer authentication is required before searching case memory.' }, { status: 401 })
-  }
-
   const body = await request.json().catch(() => null)
   const parsed = searchSchema.safeParse(body)
   if (!parsed.success) return NextResponse.json({ error: 'A valid case ID and search query are required.' }, { status: 400 })

@@ -14,9 +14,6 @@ type Entry = {
 type Chat = { id?: string; title?: string; location?: string; logs?: Entry[] }
 
 export async function POST(request: Request) {
-  if (process.env.NODE_ENV === 'production') {
-    return NextResponse.json({ error: 'Neon chat sync is disabled until officer authentication is configured.' }, { status: 401 })
-  }
   if (!process.env.DATABASE_URL) return new Response(null, { status: 204 })
 
   let body: { chats?: unknown }
