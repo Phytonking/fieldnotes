@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { Archive, AudioLines, Check, ChevronDown, Circle, Menu, MessageSquare, Mic, Moon, MoreHorizontal, Plus, Search, Shield, Sparkles, Sun, UserRound, Wrench, X } from 'lucide-react'
+import { useEveAgent } from 'eve/react'
 import { loadChatSnapshot, saveChatSnapshot, type StoredLogEntry } from '@/lib/chat-store'
 
 type LogEntry = StoredLogEntry
@@ -36,16 +37,56 @@ export default function Page() {
   const [search, setSearch] = useState('')
   const [storageReady, setStorageReady] = useState(false)
   const [storageError, setStorageError] = useState(false)
+  const [databaseStatus, setDatabaseStatus] = useState<'checking' | 'local' | 'connected' | 'error'>('checking')
   const streamRef = useRef<MediaStream | null>(null)
   const recordingChatId = useRef('')
   const speechRef = useRef<SpeechRecognizer | null>(null)
   const lastFinalResultRef = useRef(0)
-  const conversationRef = useRef<Record<string, Array<{ id: string; role: 'user' | 'assistant'; content: string }>>>({})
   const turnQueueRef = useRef<Promise<void>>(Promise.resolve())
   const sessionActiveRef = useRef(false)
   const assistantSpeakingRef = useRef(false)
+  const pendingAssistantRef = useRef<{ chatId: string; id: number; transcript: string } | null>(null)
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0]
   const currentLogs = logs[selectedId] ?? []
+  const scoutAgent = useEveAgent({
+    onEvent(event) {
+      if (event.type !== 'message.appended') return
+      const pending = pendingAssistantRef.current
+      if (!pending) return
+      pending.transcript += event.data.messageDelta
+      const transcript = pending.transcript
+      setLogs((all) => ({ ...all, [pending.chatId]: (all[pending.chatId] ?? []).map((entry) => entry.id === pending.id ? { ...entry, transcript, duration: 'live' } : entry) }))
+    },
+    onFinish(snapshot) {
+      const pending = pendingAssistantRef.current
+      if (!pending) return
+      const assistantMessage = [...snapshot.data.messages].reverse().find((message) => message.role === 'assistant')
+      const transcript = assistantMessage?.parts.filter((part) => part.type === 'text').map((part) => part.text).join(' ').trim() || pending.transcript
+      setLogs((all) => ({ ...all, [pending.chatId]: (all[pending.chatId] ?? []).map((entry) => entry.id === pending.id ? { ...entry, transcript, duration: 'done' } : entry) }))
+      pendingAssistantRef.current = null
+      if (transcript && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel()
+        assistantSpeakingRef.current = true
+        speechRef.current?.stop()
+        const spokenReply = new SpeechSynthesisUtterance(transcript)
+        const resumeRecognition = () => {
+          assistantSpeakingRef.current = false
+          if (sessionActiveRef.current && speechRef.current) {
+            try { speechRef.current.start() } catch { /* Recognition restarts from its onend callback if needed. */ }
+          }
+        }
+        spokenReply.onend = resumeRecognition
+        spokenReply.onerror = resumeRecognition
+        window.speechSynthesis.speak(spokenReply)
+      }
+    },
+    onError(error) {
+      const pending = pendingAssistantRef.current
+      if (!pending) return
+      setLogs((all) => ({ ...all, [pending.chatId]: (all[pending.chatId] ?? []).map((entry) => entry.id === pending.id ? { ...entry, transcript: error.message || 'Scout could not respond.', duration: 'error' } : entry) }))
+      pendingAssistantRef.current = null
+    },
+  })
 
   useEffect(() => {
     const savedTheme = window.localStorage.getItem('on-scene-theme')
@@ -92,7 +133,24 @@ export default function Page() {
     saveChatSnapshot({ cases, logs, selectedId }).then(() => setStorageError(false)).catch(() => setStorageError(true))
   }, [cases, logs, selectedId, storageReady])
 
+  useEffect(() => {
+    if (!storageReady) return
+    const timeout = window.setTimeout(() => {
+      void fetch('/api/chat/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chats: cases.map((item) => ({ ...item, logs: logs[item.id] ?? [] })) }),
+        keepalive: true,
+      }).then((response) => {
+        setDatabaseStatus(response.status === 204 ? 'local' : response.ok ? 'connected' : 'error')
+      }).catch(() => setDatabaseStatus('error'))
+    }, 700)
+    return () => window.clearTimeout(timeout)
+  }, [cases, logs, storageReady])
+
   function selectCase(item: CaseItem) {
+    if (scoutAgent.status === 'streaming' || scoutAgent.status === 'submitted') void scoutAgent.cancel().catch(() => {})
+    scoutAgent.reset()
     speechRef.current?.stop()
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
@@ -106,6 +164,8 @@ export default function Page() {
   }
 
   function newChat() {
+    if (scoutAgent.status === 'streaming' || scoutAgent.status === 'submitted') void scoutAgent.cancel().catch(() => {})
+    scoutAgent.reset()
     sessionActiveRef.current = false
     speechRef.current?.stop()
     speechRef.current = null
@@ -128,9 +188,6 @@ export default function Page() {
       streamRef.current = stream
       recordingChatId.current = selectedId
       lastFinalResultRef.current = 0
-      conversationRef.current[selectedId] = currentLogs
-        .filter((entry) => (entry.kind === 'officer' || entry.kind === 'assistant') && entry.transcript)
-        .map((entry) => ({ id: String(entry.id), role: entry.kind === 'officer' ? 'user' as const : 'assistant' as const, content: entry.transcript! }))
       const speechWindow = window as Window & { SpeechRecognition?: new () => SpeechRecognizer; webkitSpeechRecognition?: new () => SpeechRecognizer }
       const SpeechRecognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition
       if (!SpeechRecognition) {
@@ -183,59 +240,25 @@ export default function Page() {
 
   async function sendOfficerTurn(transcript: string) {
     const chatId = recordingChatId.current
-    const officerTurn = { id: crypto.randomUUID(), role: 'user' as const, content: transcript }
-    const history = conversationRef.current[chatId] ?? []
-    conversationRef.current[chatId] = [...history, officerTurn]
+    const caseItem = cases.find((item) => item.id === chatId)
     const assistantId = Date.now() + Math.random()
-    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId - 0.25, kind: 'officer', time: 'now', transcript, duration: 'live' }] }))
-    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId, kind: 'assistant', time: 'now', transcript: '', duration: '…' }] }))
+    pendingAssistantRef.current = { chatId, id: assistantId, transcript: '' }
+    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId - 0.25, memoryId: crypto.randomUUID(), kind: 'officer', time: 'now', transcript, duration: 'done' }] }))
+    setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: assistantId, memoryId: `${assistantId}:assistant`, kind: 'assistant', time: 'now', transcript: '', duration: '…' }] }))
 
     try {
-      const caseItem = cases.find((item) => item.id === chatId)
-      const response = await fetch('/api/assistant', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caseId: chatId, caseTitle: caseItem?.title, location: caseItem?.location, messages: conversationRef.current[chatId] }),
+      await scoutAgent.send(transcript, {
+        clientContext: { caseId: chatId, caseTitle: caseItem?.title ?? 'Unknown case', location: caseItem?.location ?? 'Unknown' },
       })
-      if (!response.ok || !response.body) {
-        const error = await response.json().catch(() => ({})) as { error?: string }
-        throw new Error(error.error || 'Scout could not respond. Check the AI Gateway connection.')
-      }
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let answer = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        answer += decoder.decode(value, { stream: true })
-        const streamedAnswer = answer
-        setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId ? { ...entry, transcript: streamedAnswer, duration: 'live' } : entry) }))
-      }
-      answer += decoder.decode()
-      conversationRef.current[chatId] = [...(conversationRef.current[chatId] ?? []), { id: `${officerTurn.id}:assistant`, role: 'assistant', content: answer }]
-      setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId ? { ...entry, transcript: answer, duration: 'live' } : entry) }))
-      if (answer && typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel()
-        assistantSpeakingRef.current = true
-        speechRef.current?.stop()
-        const spokenReply = new SpeechSynthesisUtterance(answer)
-        const resumeRecognition = () => {
-          assistantSpeakingRef.current = false
-          if (sessionActiveRef.current && speechRef.current) {
-            try { speechRef.current.start() } catch { /* Recognition restarts from its onend callback if needed. */ }
-          }
-        }
-        spokenReply.onend = resumeRecognition
-        spokenReply.onerror = resumeRecognition
-        window.speechSynthesis.speak(spokenReply)
-      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Scout could not respond. Check the AI Gateway connection.'
-      setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId ? { ...entry, transcript: message, duration: 'error' } : entry) }))
+      const message = error instanceof Error ? error.message : 'Scout could not respond. Check the Scout connection.'
+      setLogs((all) => ({ ...all, [chatId]: (all[chatId] ?? []).map((entry) => entry.id === assistantId || entry.id === assistantId - 0.25 ? { ...entry, duration: 'error', ...(entry.id === assistantId ? { transcript: message } : {}) } : entry) }))
+      pendingAssistantRef.current = null
     }
   }
 
   function endAgent() {
+    if (scoutAgent.status === 'streaming' || scoutAgent.status === 'submitted') void scoutAgent.cancel().catch(() => {})
     sessionActiveRef.current = false
     assistantSpeakingRef.current = false
     speechRef.current?.stop()
@@ -270,7 +293,7 @@ export default function Page() {
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-[68px] shrink-0 items-center justify-between border-b border-[var(--scene-border)] bg-[var(--scene-panel)] px-4 sm:px-7">
           <div className="flex min-w-0 items-center gap-3"><button onClick={() => setMobileRail(true)} className="rounded-md p-1.5 text-[var(--scene-muted)] hover:bg-[var(--scene-hover)] md:hidden" aria-label="Open chats"><Menu size={17} /></button><div className="min-w-0"><div className="flex items-center gap-2"><h1 className="truncate text-[14px] font-semibold tracking-[-0.02em]">{selected.title}</h1><ChevronDown size={13} className="shrink-0 text-[var(--scene-muted)]" /></div><p className="mt-0.5 truncate text-[10px] text-[var(--scene-muted)]">{selected.id} <span className="mx-1 text-[var(--scene-muted)]">·</span> {selected.location}</p></div></div>
-          <div className="flex items-center gap-2"><div title={storageError ? 'Local database is unavailable; changes may not persist.' : 'Chats are saved in this browser.'} className="hidden items-center gap-1.5 rounded-full border border-[var(--scene-border)] bg-[var(--scene-card)] px-2.5 py-1.5 text-[10px] text-[var(--scene-muted)] sm:flex"><Circle size={7} className={storageError ? 'fill-[#bf6c55] text-[#bf6c55]' : 'fill-[#79a084] text-[#79a084]'} /> {storageError ? 'Storage unavailable' : 'Saved on this device'}</div><button onClick={toggleTheme} className="rounded-md p-2 text-[var(--scene-muted)] hover:bg-[var(--scene-hover)]" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}</button><button className="rounded-md p-2 text-[var(--scene-muted)] hover:bg-[var(--scene-hover)]" aria-label="More conversation options"><MoreHorizontal size={17} /></button></div>
+          <div className="flex items-center gap-2"><div title={storageError ? 'Local database is unavailable; changes may not persist.' : databaseStatus === 'connected' ? 'Chats are saved in this browser and synced to Neon.' : databaseStatus === 'error' ? 'Neon sync failed; the browser copy remains available.' : 'Chats are saved in this browser. Neon sync is not configured.'} className="hidden items-center gap-1.5 rounded-full border border-[var(--scene-border)] bg-[var(--scene-card)] px-2.5 py-1.5 text-[10px] text-[var(--scene-muted)] sm:flex"><Circle size={7} className={storageError || databaseStatus === 'error' ? 'fill-[#bf6c55] text-[#bf6c55]' : 'fill-[#79a084] text-[#79a084]'} /> {storageError ? 'Storage unavailable' : databaseStatus === 'connected' ? 'Neon connected' : databaseStatus === 'error' ? 'Neon sync issue' : 'Saved on device'}</div><button onClick={toggleTheme} className="rounded-md p-2 text-[var(--scene-muted)] hover:bg-[var(--scene-hover)]" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}</button><button className="rounded-md p-2 text-[var(--scene-muted)] hover:bg-[var(--scene-hover)]" aria-label="More conversation options"><MoreHorizontal size={17} /></button></div>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col">

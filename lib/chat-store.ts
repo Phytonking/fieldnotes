@@ -15,6 +15,7 @@ export type StoredLogEntry = {
   transcript?: string
   detail?: string
   duration?: string
+  memoryId?: string
   audioBlob?: Blob
   audioUrl?: string
 }
