@@ -287,7 +287,7 @@ export default function Page() {
       const response = await fetch('/api/live/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ callSlip: selected }),
+        body: JSON.stringify({ callSlip: { ...selected, caseId: selected.id } }),
       })
       const setup = await response.json() as { token?: string; expiresAt?: number; instructions?: string; error?: string }
       if (!response.ok || !setup.token || !setup.instructions) throw new Error(setup.error || 'GPT-Live could not be started.')
