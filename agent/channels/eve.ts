@@ -1,8 +1,8 @@
 import { eveChannel } from 'eve/channels/eve'
-import { localDev, placeholderAuth, vercelOidc } from 'eve/channels/auth'
+import { none } from 'eve/channels/auth'
 
 export default eveChannel({
-  // Local browser use is enabled for development. Production stays fail-closed
-  // until the app supplies real officer sign-in and case-scoped authorization.
-  auth: [vercelOidc(), localDev(), placeholderAuth()],
+  // This workspace deliberately exposes synthetic records for its hackathon demo.
+  // Replace with verified officer and case-scoped authorization before real use.
+  auth: [none()],
 })
