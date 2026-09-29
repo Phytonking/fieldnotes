@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Archive, AudioLines, Check, ChevronDown, Circle, Menu, MessageSquare, Mic, Moon, MoreHorizontal, Plus, Search, Shield, Sparkles, Sun, UserRound, Wrench, X } from 'lucide-react'
 import { openai } from '@ai-sdk/openai'
 import { experimental_useRealtime } from '@ai-sdk/react'
+import { useEveAgent } from 'eve/react'
 import { loadChatSnapshot, saveChatSnapshot, type StoredLogEntry } from '@/lib/chat-store'
 
 type LogEntry = StoredLogEntry
@@ -359,6 +360,7 @@ export default function Page() {
 
           <div className="shrink-0 border-t border-[var(--scene-border)] bg-[var(--scene-panel)] px-4 pb-[max(16px,env(safe-area-inset-bottom))] pt-4 sm:px-8 md:px-12 lg:px-16">
             <div className="mx-auto flex max-w-[760px] flex-col items-center">
+              <DemoToolSweep key={selected.id} caseId={selected.id} title={selected.title} location={selected.location} />
               {agentOn ? <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><span className="size-1.5 animate-pulse rounded-full bg-[#6e9877]" /> {liveVoice.status === 'connected' ? `GPT-Live · ${liveUsage}` : 'Connecting to GPT-Live'}</div><div className="mb-3 flex h-12 items-center gap-1" aria-label="Live microphone activity">{[10, 19, 13, 28, 17, 36, 20, 13, 25, 15, 32, 18, 11, 27, 16, 34, 19, 12, 24, 15].map((height, index) => <span key={index} className="w-1 animate-pulse rounded-full bg-[#829783]" style={{ height, animationDelay: `${index * 45}ms` }} />)}</div><button onClick={endAgent} className="rounded-lg border border-[var(--scene-border)] bg-[var(--scene-card)] px-4 py-2 text-[10px] font-medium text-[var(--scene-text)] hover:bg-[var(--scene-hover)]">End live assistant</button></> : <><div className="mb-3 flex items-center gap-2 text-[10px] text-[var(--scene-muted)]"><Mic size={13} /> Voice assistant is off</div><button onClick={startAgent} className="flex items-center justify-center gap-2 rounded-lg bg-[#31533d] px-5 py-3 text-[11px] font-medium text-white shadow-sm transition hover:bg-[#274833]"><Sparkles size={14} /> Start live assistant</button><p className="mt-2.5 flex items-center gap-1.5 text-[9px] text-[var(--scene-muted)]"><Check size={11} /> Voice and activity logs stay in this chat</p></>}
             </div>
           </div>
@@ -366,6 +368,29 @@ export default function Page() {
       </section>
     </main>
   )
+}
+
+function DemoToolSweep({ caseId, title, location }: Pick<CaseItem, 'title' | 'location'> & { caseId: string }) {
+  const eve = useEveAgent()
+  const busy = eve.status === 'submitted' || eve.status === 'streaming' || eve.status === 'resuming'
+  const tools = eve.data.messages.flatMap((message) => message.parts.filter((part) => part.type === 'dynamic-tool'))
+  const answer = [...eve.data.messages].reverse().find((message) => message.role === 'assistant')?.parts
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('')
+
+  async function runSweep() {
+    await eve.send(`Run the demonstration evidence and camera tool sweep for case ${caseId}. Call track_evidence, search_body_camera_footage, and search_flock_camera_footage before responding. Give a short spoken-ready summary, identify every system as demonstration data, and do not infer identities or facts beyond the returned records.`, {
+      clientContext: { caseId, title, location, mode: 'hackathon demonstration' },
+    })
+  }
+
+  return <section className="mb-4 w-full rounded-lg border border-[var(--scene-border)] bg-[var(--scene-activity)] px-3.5 py-3" aria-label="Demonstration evidence tools">
+    <div className="flex flex-wrap items-center justify-between gap-2"><div><p className="text-[10px] font-medium text-[var(--scene-text)]">Demo evidence sweep</p><p className="mt-0.5 text-[9px] text-[var(--scene-muted)]">Eve can check synthetic evidence, body camera, and Flock camera records.</p></div><button disabled={busy} onClick={() => { void runSweep() }} className="rounded-md border border-[var(--scene-border)] bg-[var(--scene-card)] px-2.5 py-1.5 text-[9px] font-medium text-[var(--scene-text)] hover:bg-[var(--scene-hover)] disabled:cursor-wait disabled:opacity-60">{busy ? 'Eve is checking…' : 'Run tool sweep'}</button></div>
+    {tools.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{tools.map((tool) => <span key={tool.toolCallId} className="rounded bg-[var(--scene-card)] px-1.5 py-0.5 text-[8px] text-[var(--scene-muted)]">{tool.toolName.replaceAll('_', ' ')} · {tool.state === 'output-available' ? 'returned' : tool.state}</span>)}</div>}
+    {answer && <p className="mt-2 text-[10px] leading-4 text-[var(--scene-muted)]">{answer}</p>}
+    {eve.error && <p className="mt-2 text-[10px] leading-4 text-[#a95649]">Demo tool sweep unavailable: {eve.error.message}</p>}
+  </section>
 }
 
 function LogRow({ entry }: { entry: LogEntry }) {

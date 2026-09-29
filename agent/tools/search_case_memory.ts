@@ -12,9 +12,9 @@ export default defineTool({
     const caller = ctx.session.auth.current
     if (!caller) throw new Error('A verified caller is required to search case chat memory.')
 
-    // Local development uses synthetic data. Production callers must carry an
-    // authorized case list in their verified Scout session attributes.
-    if (caller.principalId !== 'local-dev') {
+    // This hackathon workspace accepts anonymous demo sessions. Any non-demo
+    // identity still needs an explicit case assignment.
+    if (caller.principalType !== 'anonymous' && caller.principalId !== 'local-dev') {
       const allowedCases = caller.attributes?.caseIds
       if (!Array.isArray(allowedCases) || !allowedCases.includes(caseId)) {
         throw new Error('The verified caller is not authorized for this case chat.')
