@@ -17,3 +17,5 @@ node_modules
 
 # Eve local runtime state
 .eve/
+.vercel
+.env*
