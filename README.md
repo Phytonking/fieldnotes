@@ -24,6 +24,8 @@ Scout uses OpenAI GPT-Live 1 through Vercel AI Gateway for full-duplex microphon
 
 The system prompt lives in `agent/instructions.md`. GPT-Live searches the connected Neon case-chat memory while the officer speaks. The demo tool sweep sends a request to Eve, which can call the synthetic evidence ledger, body-worn camera index, and Flock camera index. These return demonstration metadata only; no real records system, footage provider, dispatch, or evidence platform is connected.
 
+Eve can also search and fetch the live public web through `search_web` and `fetch_web_page`, backed by [TinyFish's free Search and Fetch API](https://www.tinyfish.ai/free-search-fetch) — useful for looking up statutes, ordinances, or agency policy pages. Create a free key at [agent.tinyfish.ai](https://agent.tinyfish.ai) and set `TINYFISH_API_KEY` in `.env.local`; without it, Eve reports those tools as unavailable. Unlike the demo tools above, TinyFish results are real public web content, not synthetic data — Scout is instructed to keep case identifiers, names, and addresses out of these calls and to treat results as unverified background, not legal or agency authority.
+
 ## Chat storage and retrieval
 
 The browser keeps a local IndexedDB copy so chats survive reloads. To enable a shared, searchable Neon database, create a Neon Postgres database with `pgvector`, run `db/migrations/001_chat_memory.sql` in its SQL editor, and set `DATABASE_URL` in `.env.local` from `.env.example`. Keep that connection string server-side; the browser never connects to Postgres directly.
