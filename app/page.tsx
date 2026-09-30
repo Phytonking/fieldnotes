@@ -43,13 +43,14 @@ export default function Page() {
   const [liveToken, setLiveToken] = useState('')
   const [liveInstructions, setLiveInstructions] = useState('')
   const [pendingLiveStream, setPendingLiveStream] = useState<MediaStream | null>(null)
-  const [liveContextUpdate, setLiveContextUpdate] = useState<{ content: string; channel: 'thinking' | 'commentary' } | null>(null)
+  const [liveContextUpdate, setLiveContextUpdate] = useState<{ content: string; channel: 'thinking' | 'commentary'; delegationId: string | null } | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const recordingChatId = useRef('')
   const transcriptEntriesRef = useRef(new Map<string, string>())
   const activeOfficerTranscriptRef = useRef({ startMs: -1, text: '' })
   const lastMemoryQueryRef = useRef('')
   const memorySearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const eveLiveSessionIdRef = useRef<string | undefined>(undefined)
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0]
   const currentLogs = logs[selectedId] ?? []
   const realtimeConfig = useMemo(() => ({
@@ -68,12 +69,18 @@ export default function Page() {
     onEvent(event) {
       const chatId = recordingChatId.current
       if (event.type === 'session-started') {
-        setLiveContextUpdate({ content: 'Start the conversation now by asking the officer what they are seeing. Do not list records.', channel: 'commentary' })
+        setLiveContextUpdate({ content: 'Start the conversation now by asking the officer what they are seeing. Do not list records.', channel: 'commentary', delegationId: null })
         return
       }
       if (event.type === 'session-usage') {
         const seconds = Math.floor(event.usage.seconds)
         setLiveUsage(`${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`)
+        return
+      }
+      if (event.type === 'delegation-created') {
+        if (event.target === 'provider' || !chatId) return
+        const question = activeOfficerTranscriptRef.current.text.trim() || 'Ask the officer what they are seeing at the scene right now.'
+        void respondToDelegation(chatId, event.delegationId, question)
         return
       }
       if (event.type !== 'transcript-fragment' || !chatId) return
@@ -123,13 +130,38 @@ export default function Page() {
     setLiveContextUpdate(null)
     void liveVoice.sendEvent({
       type: 'context-append',
-      delegationId: null,
+      delegationId: contextUpdate.delegationId,
       content: contextUpdate.content,
       providerOptions: { openai: { channel: contextUpdate.channel } },
     }).catch((error) => {
       console.error('Could not update GPT-Live context:', error instanceof Error ? error.message : 'unknown error')
     })
   }, [liveContextUpdate, liveVoice.status, liveVoice.sendEvent])
+
+  async function respondToDelegation(chatId: string, delegationId: string, question: string) {
+    try {
+      const response = await fetch('/api/live/delegate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ caseId: chatId, delegationId, question, sessionId: eveLiveSessionIdRef.current }),
+      })
+      const result = await response.json() as { sessionId?: string; text?: string; error?: string }
+      if (!response.ok) throw new Error(result.error || 'Eve could not answer.')
+      if (result.sessionId) eveLiveSessionIdRef.current = result.sessionId
+      setLiveContextUpdate({
+        channel: 'commentary',
+        delegationId,
+        content: result.text?.trim() || 'Say that you need a moment, and ask the officer to say that again.',
+      })
+    } catch (error) {
+      console.error('Live delegation to Eve failed:', error instanceof Error ? error.message : 'unknown error')
+      setLiveContextUpdate({
+        channel: 'commentary',
+        delegationId,
+        content: 'Say that the connected system could not respond just now, and ask the officer to repeat what they need.',
+      })
+    }
+  }
 
   useEffect(() => {
     if (!liveToken || !pendingLiveStream || !liveInstructions) return
@@ -237,12 +269,13 @@ export default function Page() {
       setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: Date.now() + Math.random(), kind: 'tool', time: 'now', text: `Searched ${result.system ?? 'Neon case chat memory'}`, detail: records.length ? `${records.length} saved chat message(s) returned.` : 'No matching prior messages.' }] }))
       setLiveContextUpdate({
         channel: 'thinking',
+        delegationId: null,
         content: `Connected system result: ${result.system ?? 'Neon case chat memory'}. Checked ${result.checkedAt ? new Date(result.checkedAt).toISOString() : 'just now'}. This is only saved chat history for the selected case, not a live incident or neighborhood records feed. ${records.length ? `Records returned: ${detail}` : 'No matching prior chat messages were returned.'}`,
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Neon case memory is unavailable.'
       setLogs((all) => ({ ...all, [chatId]: [...(all[chatId] ?? []), { id: Date.now() + Math.random(), kind: 'tool', time: 'now', text: 'Neon case chat memory unavailable', detail: message }] }))
-      setLiveContextUpdate({ channel: 'thinking', content: `Neon case chat memory could not be searched. Do not claim that a neighborhood records or incident feed was checked.` })
+      setLiveContextUpdate({ channel: 'thinking', delegationId: null, content: `Neon case chat memory could not be searched. Do not claim that a neighborhood records or incident feed was checked.` })
     }
   }
 
@@ -295,6 +328,7 @@ export default function Page() {
       transcriptEntriesRef.current.clear()
       activeOfficerTranscriptRef.current = { startMs: -1, text: '' }
       lastMemoryQueryRef.current = ''
+      eveLiveSessionIdRef.current = undefined
       setLiveUsage('0:00')
       setLiveInstructions(setup.instructions)
       setLiveToken(setup.token)
